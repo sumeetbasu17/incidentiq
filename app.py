@@ -320,6 +320,17 @@ st.markdown("""
         background: #1f2937 !important;
         border-radius: 8px !important;
     }
+
+    /* ── Popover (Manage docs) — dark theme ── */
+    [data-testid="stPopover"] > div {
+        background: #1e2433 !important;
+        border: 1px solid #374151 !important;
+        border-radius: 10px !important;
+    }
+    [data-testid="stPopover"] [data-testid="stMarkdown"],
+    [data-testid="stPopover"] .stCaption p {
+        color: #c9d1d9 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -331,6 +342,70 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "is_investigating" not in st.session_state:
     st.session_state.is_investigating = False
+if "last_rca" not in st.session_state:
+    st.session_state.last_rca = None  # stores the full RCA context for Slack etc.
+if "slack_sent" not in st.session_state:
+    st.session_state.slack_sent = False
+
+
+# ─────────────────────────────────────────────────
+# Slack send handler — runs on rerun after button click
+# ─────────────────────────────────────────────────
+def _send_to_slack():
+    """Send the last RCA to Slack using the webhook. Returns (success, message)."""
+    rca = st.session_state.get("last_rca")
+    if not rca or not Config.SLACK_WEBHOOK_URL:
+        return False, "No RCA data or Slack webhook not configured"
+    try:
+        import requests as _req
+        import re as _slack_re
+
+        _severity = rca["severity"]
+        _sev_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🔵", "LOW": "🟢"}.get(_severity, "⚪")
+        _err_type = rca["error_info"].get("error_type", "Unknown")
+        _final = rca["final_output"]
+
+        _rc_match = _slack_re.search(
+            r"(?:Root Cause|root cause)[:\s*]*(.{20,400})",
+            _final, _slack_re.IGNORECASE | _slack_re.DOTALL,
+        )
+        _rc_text = _rc_match.group(1).strip()[:300] if _rc_match else "See full RCA"
+        _rc_text = _slack_re.sub(r"\*+", "", _rc_text).strip()
+
+        _payload = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": f"{_sev_emoji} IncidentIQ — {_severity} Incident", "emoji": True},
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Error:*\n{_err_type}"},
+                        {"type": "mrkdwn", "text": f"*Severity:*\n{_severity}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*Root Cause:*\n{_rc_text}"},
+                },
+                {"type": "divider"},
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"🔍 Investigated by IncidentIQ • {rca['timestamp']}"}],
+                },
+            ],
+        }
+
+        _resp = _req.post(Config.SLACK_WEBHOOK_URL, json=_payload, timeout=10)
+        if _resp.status_code == 200:
+            return True, "✓ RCA sent to Slack"
+        else:
+            return False, f"Slack error: {_resp.status_code} — {_resp.text[:100]}"
+    except ImportError:
+        return False, "Install `requests` — `pip install requests`"
+    except Exception as e:
+        return False, f"Slack error: {str(e)[:100]}"
 
 
 # ─────────────────────────────────────────────────
@@ -399,40 +474,107 @@ with st.sidebar:
                         count += 1
             st.success(f"✓ {count} runbooks loaded")
 
-    # Show what's loaded — with delete buttons
+    # Show what's loaded — compact count + popover for details
     try:
         from tools.runbook_rag import get_ingested_docs, delete_document, clear_all_documents
         docs = get_ingested_docs()
         if docs:
-            for d in docs:
-                _doc_col1, _doc_col2 = st.columns([4, 1])
-                with _doc_col1:
-                    st.caption(f"📄 {d}")
-                with _doc_col2:
-                    if st.button("✕", key=f"del_{d}", help=f"Remove {d}"):
-                        delete_document(d)
+            _doc_count = len(docs)
+            _dc1, _dc2 = st.columns([3, 2])
+            with _dc1:
+                st.markdown(
+                    f'<span style="color:#9ca3af;font-size:0.82rem;">'
+                    f'📄 {_doc_count} doc{"s" if _doc_count != 1 else ""} loaded</span>',
+                    unsafe_allow_html=True,
+                )
+            with _dc2:
+                with st.popover("Manage", use_container_width=True):
+                    st.markdown(
+                        '<span style="color:#d1d5db;font-size:0.85rem;font-weight:600;">'
+                        'Uploaded Documents</span>',
+                        unsafe_allow_html=True,
+                    )
+                    for d in sorted(docs):
+                        _pc1, _pc2 = st.columns([5, 1])
+                        with _pc1:
+                            st.caption(f"📄 {d}")
+                        with _pc2:
+                            if st.button("✕", key=f"del_{d}", help=f"Remove {d}"):
+                                delete_document(d)
+                                st.rerun()
+                    st.markdown("")
+                    if st.button("🗑 Clear all", use_container_width=True, key="clear_all_docs"):
+                        clear_all_documents()
+                        st.success("✓ Cleared")
                         st.rerun()
-            if st.button("🗑 Clear all runbooks", use_container_width=True):
-                clear_all_documents()
-                st.success("✓ All runbooks cleared")
-                st.rerun()
     except Exception:
         pass
 
     st.markdown("---")
 
-    # Incident Memory management
-    try:
-        from tools.incident_memory import get_incident_history, clear_incident_memory
-        _inc_count = len(get_incident_history(limit=100))
-        if _inc_count > 0:
-            st.markdown(f"**Incident Memory** ({_inc_count})")
-            if st.button("🗑 Clear incident memory", use_container_width=True):
-                clear_incident_memory()
-                st.success("✓ Incident memory cleared")
-                st.rerun()
-    except Exception:
-        pass
+    # Incident Memory management — compact count + Manage popover
+    # Mirrors the Team Docs pattern for visual consistency.
+    _incident_memory_placeholder = st.empty()
+    _incident_detail_placeholder = st.empty()
+
+    def _render_incident_memory_sidebar():
+        """Render the incident memory section (called initially and after store)."""
+        try:
+            from tools.incident_memory import get_incident_history, clear_incident_memory
+            _incidents = get_incident_history(limit=100)
+            _inc_count = len(_incidents)
+            if _inc_count > 0:
+                with _incident_memory_placeholder.container():
+                    _mc1, _mc2 = st.columns([3, 2])
+                    with _mc1:
+                        st.markdown(
+                            f'<span style="color:#9ca3af;font-size:0.82rem;">'
+                            f'🧠 {_inc_count} incident{"s" if _inc_count != 1 else ""} stored</span>',
+                            unsafe_allow_html=True,
+                        )
+                    with _mc2:
+                        with st.popover("Manage", use_container_width=True):
+                            st.markdown(
+                                '<span style="color:#d1d5db;font-size:0.85rem;font-weight:600;">'
+                                'Incident Memory</span>',
+                                unsafe_allow_html=True,
+                            )
+                            for _inc in _incidents:
+                                _iid = _inc["id"][:8]
+                                _etype = _inc.get("error_type", "Unknown")[:30]
+                                _sev = _inc.get("severity", "?")
+                                _ts = _inc.get("timestamp", "")[:16].replace("T", " ")
+                                _rc = _inc.get("root_cause", "")[:80]
+                                # Severity color dot
+                                _sev_color = {
+                                    "CRITICAL": "#ef4444", "HIGH": "#f59e0b",
+                                    "MEDIUM": "#3b82f6", "LOW": "#22c55e",
+                                }.get(_sev, "#6b7280")
+                                st.markdown(
+                                    f'<div style="padding:6px 0;border-bottom:1px solid #30363d;">'
+                                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem;color:#8b949e;">'
+                                    f'`{_iid}`</span> &nbsp;'
+                                    f'<span style="background:{_sev_color}22;color:{_sev_color};'
+                                    f'padding:1px 6px;border-radius:3px;font-size:0.68rem;font-weight:600;">'
+                                    f'{_sev}</span><br>'
+                                    f'<span style="color:#d1d5db;font-size:0.78rem;">{_etype}</span><br>'
+                                    f'<span style="color:#6b7280;font-size:0.7rem;">{_ts}</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            st.markdown("")
+                            if st.button("🗑 Clear all", use_container_width=True, key="clear_inc_mem"):
+                                clear_incident_memory()
+                                st.success("✓ Cleared")
+                                st.rerun()
+                _incident_detail_placeholder.empty()
+            else:
+                _incident_memory_placeholder.empty()
+                _incident_detail_placeholder.empty()
+        except Exception:
+            pass
+
+    _render_incident_memory_sidebar()
 
     st.markdown("---")
 
@@ -440,7 +582,8 @@ with st.sidebar:
     st.markdown("**Connections**")
     for name, ok in Config.validate().items():
         friendly = {"OpenRouter LLM": "AI Engine", "Tavily Search": "Web Search",
-                     "Serper Search": "StackOverflow", "LangSmith Tracing": "Tracing"}.get(name, name)
+                     "Serper Search": "StackOverflow", "LangSmith Tracing": "Tracing",
+                     "Slack": "Slack"}.get(name, name)
         dot = "st-dot-ok" if ok else "st-dot-no"
         st.markdown(f'<span class="st-dot {dot}"></span> {friendly}', unsafe_allow_html=True)
 
@@ -457,10 +600,10 @@ with st.sidebar:
 
     # Deploy help
     with st.expander("🌐 Share via public URL"):
-        st.code("# Cloudflare Tunnel\ncloudflared tunnel --url http://localhost:8501\n\n# Or ngrok\nngrok http 8501", language="bash")
+        st.code("# brew install cloudflared\n# Cloudflare Tunnel\ncloudflared tunnel --url http://localhost:8501\n\n# Or ngrok\nngrok http 8501", language="bash")
 
     st.markdown("---")
-    st.caption("LangGraph • ChromaDB • Tavily • LangSmith")
+    st.caption("LangGraph • ChromaDB • Tavily • LangSmith • Slack")
 
 
 # ─────────────────────────────────────────────────
@@ -482,6 +625,11 @@ if st.session_state.get("clear_input", False):
     st.session_state["clear_input"] = False
     st.session_state["log_input"] = ""
 
+# Sample scenario flag — must be checked BEFORE the widget renders
+if st.session_state.get("_load_scenario", None):
+    st.session_state["log_input"] = st.session_state["_load_scenario"]
+    st.session_state["_load_scenario"] = None
+
 log_input = st.text_area(
     "Error log",
     height=180,
@@ -498,6 +646,8 @@ with col_btn_inv:
 with col_btn_clr:
     if st.button("🗑 Clear", use_container_width=True):
         st.session_state["clear_input"] = True
+        st.session_state.last_rca = None
+        st.session_state.slack_sent = False
         st.rerun()
 
 # ─────────────────────────────────────────────────
@@ -515,7 +665,7 @@ with st.expander("📦 Sample scenarios", expanded=not log_input):
     for i, (key, label) in enumerate(SCENARIOS.items()):
         with cols[i % 2]:
             if st.button(label, key=f"s{i}", use_container_width=True):
-                st.session_state["log_input"] = SAMPLE_LOGS[key]
+                st.session_state["_load_scenario"] = SAMPLE_LOGS[key]
                 st.rerun()
 
 
@@ -608,55 +758,28 @@ if investigate and log_input:
 
             st.markdown(final_output)
 
-            # Save
+            # ── Save RCA context to session state ──
+            # This persists across Streamlit reruns so actions like
+            # "Send to Slack" can access the data after a button click.
+            st.session_state.last_rca = {
+                "final_output": final_output,
+                "severity": severity,
+                "error_info": error_info,
+                "log_input": log_input,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+
+            # Save to session history
             st.session_state.history.append({
                 "timestamp": datetime.now().strftime("%H:%M"),
                 "error_type": error_info.get("error_type", "Unknown"),
                 "severity": severity,
             })
 
-            try:
-                from tools.incident_memory import store_incident
-                import re as _re
-
-                def _extract_section(text, *headings):
-                    """Extract content under a markdown heading from RCA text."""
-                    for heading in headings:
-                        pattern = rf"(?:#+\s*)?{_re.escape(heading)}[:\s]*([^\n#]{{10,500}})"
-                        m = _re.search(pattern, text, _re.IGNORECASE | _re.DOTALL)
-                        if m:
-                            val = m.group(1).strip()
-                            # Trim at next heading
-                            val = _re.split(r"\n#+\s", val)[0].strip()
-                            if val and val.lower() not in ("see rca", "n/a", ""):
-                                return val[:400]
-                    return ""
-
-                extracted_rc = (
-                    _extract_section(final_output, "Root Cause", "root cause")
-                    or error_info.get("error_type", "Unknown")
-                )
-                extracted_res = (
-                    _extract_section(final_output, "Immediate Fix", "Short-term", "Remediation")
-                    or "See full RCA"
-                )
-
-                store_incident(
-                    error_type=error_info.get("error_type", "Unknown"),
-                    error_message=error_info.get("error_message", "")[:500],
-                    severity=severity, language=language, services=[],
-                    root_cause=extracted_rc,
-                    resolution=extracted_res,
-                    raw_log=log_input[:2000], full_rca=final_output,
-                )
-            except Exception:
-                pass
-
             if Config.LANGCHAIN_API_KEY:
                 _langsmith_project_id = os.getenv("LANGCHAIN_PROJECT_ID", "")
                 _org_id = os.getenv("LANGCHAIN_ORG_ID", "")
                 if _org_id and _langsmith_project_id:
-                    # Direct link to the project runs page
                     langsmith_url = (
                         "https://smith.langchain.com/o/" + _org_id
                         + "/projects/p/" + _langsmith_project_id
@@ -668,12 +791,34 @@ if investigate and log_input:
                     langsmith_url = "https://smith.langchain.com/projects/"
                 st.info("🔗 [View traces in LangSmith](" + langsmith_url + ")")
 
-            # ── Past Similar Incidents — collapsible, shown AFTER investigation ──
+            # ── Send to Slack ──
+            if Config.SLACK_WEBHOOK_URL and final_output:
+                _slack_col1, _slack_col2 = st.columns([1, 4])
+                with _slack_col1:
+                    def _on_slack_click():
+                        ok, msg = _send_to_slack()
+                        st.session_state.slack_sent = msg
+                    st.button("💬 Send to Slack", use_container_width=True,
+                              key="slack_send_btn", on_click=_on_slack_click)
+                # Show result from a previous click (persists in session state)
+                if st.session_state.slack_sent:
+                    _msg = st.session_state.slack_sent
+                    if _msg.startswith("✓"):
+                        st.success(_msg)
+                    else:
+                        st.error(_msg)
+                    st.session_state.slack_sent = False
+
+            # ── Past Similar Incidents — search BEFORE storing current ──
             try:
                 from tools.incident_memory import find_similar_incidents as _find_similar
                 import json as _json
-                # Use semantic search to get similarity scores
-                _search_query = f"{error_info.get('error_type', '')} {error_info.get('error_message', '')}"
+                # Always use raw user input as search query. It works for both cases:
+                # - Structured logs: the raw text contains the error type, stack trace,
+                #   service names — richer than extracted error_type alone
+                # - Natural language: "I am getting OOM in my service" is the best
+                #   possible semantic search query as-is
+                _search_query = log_input[:500]
                 _sim_result = _json.loads(_find_similar.invoke(_search_query))
                 _similar_list = _sim_result.get("similar_incidents", [])
                 if _similar_list:
@@ -688,7 +833,6 @@ if investigate and log_input:
                             _resolution = _inc.get("resolution", "")
                             _score = _inc.get("similarity_score", 0)
                             _score_pct = f"{_score * 100:.0f}%" if _score else "—"
-                            # Color code similarity badge
                             if _score and _score >= 0.8:
                                 _score_color = "#22c55e"
                             elif _score and _score >= 0.5:
@@ -709,12 +853,94 @@ if investigate and log_input:
             except Exception:
                 pass
 
+            # ── Store current incident AFTER showing past ones ──
+            try:
+                from tools.incident_memory import store_incident
+                import re as _re
+
+                def _extract_section(text, *headings):
+                    """Extract content under a markdown heading from RCA text."""
+                    for heading in headings:
+                        pattern = rf"(?:#+\s*)?{_re.escape(heading)}[:\s]*([^\n#]{{10,500}})"
+                        m = _re.search(pattern, text, _re.IGNORECASE | _re.DOTALL)
+                        if m:
+                            val = m.group(1).strip()
+                            val = _re.split(r"\n#+\s", val)[0].strip()
+                            if val and val.lower() not in ("see rca", "n/a", ""):
+                                return val[:400]
+                    return ""
+
+                extracted_rc = (
+                    _extract_section(final_output, "Root Cause", "root cause")
+                    or error_info.get("error_type", "Unknown")
+                )
+                extracted_res = (
+                    _extract_section(final_output, "Immediate Fix", "Short-term", "Remediation")
+                    or "See full RCA"
+                )
+
+                _store_result = store_incident(
+                    error_type=error_info.get("error_type", "Unknown"),
+                    error_message=error_info.get("error_message", "")[:500],
+                    severity=severity, language=language, services=[],
+                    root_cause=extracted_rc,
+                    resolution=extracted_res,
+                    raw_log=log_input[:2000], full_rca=final_output,
+                )
+
+                # Refresh sidebar incident memory count in real-time
+                _store_status = _store_result.get("status", "")
+                if _store_status in ("stored", "updated"):
+                    _render_incident_memory_sidebar()
+                    st.sidebar.success(f"✓ Incident `{_store_result.get('incident_id', '')}` saved to memory")
+            except Exception:
+                pass
+
         except Exception as e:
             status.empty()
             st.error(f"Failed: {str(e)}")
             st.exception(e)
         finally:
             st.session_state.is_investigating = False
+
+# ─────────────────────────────────────────────────
+# Re-render last RCA from session state (survives reruns)
+# This shows the RCA + Slack button even after a button
+# click triggers a Streamlit rerun.
+# ─────────────────────────────────────────────────
+elif st.session_state.last_rca and not st.session_state.is_investigating:
+    _rca = st.session_state.last_rca
+    _sev = _rca["severity"]
+    _final = _rca["final_output"]
+    _einfo = _rca["error_info"]
+
+    st.markdown("---")
+    st.markdown(
+        f'<div class="rca-box"><div class="rca-title">'
+        f'<span style="font-size:1.2rem;">📊</span>'
+        f'<h3>Root Cause Analysis</h3>'
+        f'<span class="sev-badge sev-{_sev}">{_sev}</span>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(_final)
+
+    # Slack button
+    if Config.SLACK_WEBHOOK_URL:
+        _sc1, _sc2 = st.columns([1, 4])
+        with _sc1:
+            def _on_slack_click_restore():
+                ok, msg = _send_to_slack()
+                st.session_state.slack_sent = msg
+            st.button("💬 Send to Slack", use_container_width=True,
+                      key="slack_send_restore", on_click=_on_slack_click_restore)
+        if st.session_state.slack_sent:
+            _msg = st.session_state.slack_sent
+            if _msg.startswith("✓"):
+                st.success(_msg)
+            else:
+                st.error(_msg)
+            st.session_state.slack_sent = False
 
 # ─────────────────────────────────────────────────
 # Footer

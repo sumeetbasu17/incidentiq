@@ -47,6 +47,9 @@ class Config:
     # --- Supported Log Formats ---
     SUPPORTED_LANGUAGES = ["python", "java", "javascript", "go", "ruby", "csharp"]
 
+    # --- Integrations ---
+    SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+
     @classmethod
     def validate(cls) -> dict:
         """Check which API keys are configured. Returns status dict."""
@@ -55,6 +58,7 @@ class Config:
             "Tavily Search": bool(cls.TAVILY_API_KEY),
             "Serper Search": bool(cls.SERPER_API_KEY),
             "LangSmith Tracing": bool(cls.LANGCHAIN_API_KEY),
+            "Slack": bool(cls.SLACK_WEBHOOK_URL),
         }
 
     @classmethod

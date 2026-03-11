@@ -13,6 +13,7 @@ from typing import Optional
 from langchain_core.tools import tool
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
+import chromadb
 from config import Config
 
 
@@ -44,17 +45,57 @@ def _init_db():
 
 
 def _get_memory_store():
-    """Get ChromaDB store for incident embeddings."""
+    """Get ChromaDB store for incident embeddings using cosine similarity.
+    
+    Why cosine? The default L2 (Euclidean) distance in high-dimensional
+    embedding space (1536-dim) produces large distances even for similar
+    texts, leading to low relevance scores.  Cosine similarity compares
+    the *direction* of vectors regardless of magnitude, which is the
+    standard metric for text-embedding similarity search.
+    """
     os.makedirs(MEMORY_CHROMA_DIR, exist_ok=True)
     embeddings = OpenAIEmbeddings(
         model=Config.EMBEDDING_MODEL,
         openai_api_key=Config.OPENAI_API_KEY,
         openai_api_base=Config.EMBEDDING_BASE_URL,
     )
+
+    # Use cosine distance — much better relevance scores for text embeddings.
+    # If an old L2 collection already exists, delete and recreate it so the
+    # distance metric actually changes (ChromaDB can't alter an existing
+    # collection's metric).
+    client = chromadb.PersistentClient(path=MEMORY_CHROMA_DIR)
+    COLLECTION_NAME = "incident_memory"
+
+    try:
+        existing = client.get_collection(COLLECTION_NAME)
+        meta = existing.metadata or {}
+        if meta.get("hnsw:space") != "cosine":
+            # Old collection uses L2 — migrate data
+            old_data = existing.get(include=["documents", "metadatas", "embeddings"])
+            client.delete_collection(COLLECTION_NAME)
+            new_col = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+            )
+            if old_data and old_data.get("ids"):
+                new_col.add(
+                    ids=old_data["ids"],
+                    documents=old_data.get("documents"),
+                    metadatas=old_data.get("metadatas"),
+                    embeddings=old_data.get("embeddings"),
+                )
+    except Exception:
+        # Collection doesn't exist yet — will be created below
+        client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+
     return Chroma(
         persist_directory=MEMORY_CHROMA_DIR,
         embedding_function=embeddings,
-        collection_name="incident_memory",
+        collection_name=COLLECTION_NAME,
     )
 
 
@@ -107,9 +148,19 @@ def store_incident(
     conn.close()
 
     # Store embedding for semantic search
+    # Include raw log snippet alongside structured fields — this makes
+    # semantic search work for both structured queries ("NullPointerException")
+    # and natural language queries ("I'm getting null pointer in my service")
     try:
         store = _get_memory_store()
-        doc_text = f"Error: {error_type} - {error_message}\nServices: {', '.join(services)}\nRoot Cause: {root_cause}\nResolution: {resolution}"
+        # Combine structured info + raw log for a richer embedding
+        raw_snippet = raw_log[:500] if raw_log else ""
+        doc_text = (
+            f"Error: {error_type} - {error_message}\n"
+            f"Root Cause: {root_cause}\n"
+            f"Resolution: {resolution}\n"
+            f"Log: {raw_snippet}"
+        )
         from langchain_core.documents import Document
         doc = Document(
             page_content=doc_text,
@@ -152,7 +203,10 @@ def find_similar_incidents(query: str) -> str:
                 "query": query,
             })
 
-        results = store.similarity_search_with_relevance_scores(query, k=3)
+        # ── Semantic search (cosine similarity) ──
+        # Fetch more candidates than we need so we can analyze the
+        # score distribution and find natural gaps.
+        results = store.similarity_search_with_relevance_scores(query, k=10)
 
         if not results:
             return json.dumps({
@@ -161,29 +215,96 @@ def find_similar_incidents(query: str) -> str:
                 "query": query,
             })
 
-        # Fetch full details from SQLite
+        # Sort by score descending
+        results.sort(key=lambda x: x[1], reverse=True)
+
+        # Log ALL raw scores for debugging
+        for doc, score in results:
+            etype = doc.metadata.get("error_type", "?")
+            print(f"[IncidentIQ] score={score:.4f} error_type={etype} | query={query[:50]}... | doc={doc.page_content[:60]}...")
+
+        scores = [s for _, s in results]
+        top_score = scores[0]
+
+        # ── Score-gap thresholding ──
+        # Instead of hardcoded keyword families, we use the score
+        # distribution itself to decide what's a real match:
+        #
+        # 1. Absolute floor: top score must clear 0.60 — with cosine
+        #    on the same embedding model, truly related incidents
+        #    (same error type) consistently score above this.
+        #    Cross-type matches (OOM vs NullPointer) sit at 0.45-0.60.
+        #
+        # 2. Gap detection: find the largest score drop between
+        #    consecutive results. Results above the gap are "real
+        #    matches"; results below are noise. This adapts to any
+        #    error type without hardcoding.
+        #
+        # 3. Relative cutoff: even without a clear gap, only keep
+        #    results within 80% of the top score.
+        ABSOLUTE_MIN = 0.60
+
+        if top_score < ABSOLUTE_MIN:
+            return json.dumps({
+                "status": "no_matches",
+                "message": "No similar past incidents found.",
+                "query": query,
+            })
+
+        # Find the largest gap in scores to separate signal from noise
+        gap_cutoff = ABSOLUTE_MIN
+        if len(scores) >= 2:
+            max_gap = 0
+            max_gap_idx = 0
+            for i in range(len(scores) - 1):
+                gap = scores[i] - scores[i + 1]
+                if gap > max_gap:
+                    max_gap = gap
+                    max_gap_idx = i
+            # Only use the gap if it's meaningful (> 0.08 = 8% jump)
+            # and the gap isn't at the very bottom of the list
+            if max_gap > 0.08 and scores[max_gap_idx] >= ABSOLUTE_MIN:
+                gap_cutoff = scores[max_gap_idx + 1] + 0.001  # just above the lower group
+
+        # Final cutoff: the stricter of gap-based and relative
+        relative_cutoff = top_score * 0.80
+        final_cutoff = max(gap_cutoff, relative_cutoff, ABSOLUTE_MIN)
+
         conn = sqlite3.connect(DB_PATH)
         similar = []
+        seen_ids = set()
+
         for doc, score in results:
+            if score < final_cutoff:
+                continue
             incident_id = doc.metadata.get("incident_id", "")
-            if incident_id:
-                    row = conn.execute(
-                        "SELECT * FROM incidents WHERE id = ?", (incident_id,)
-                    ).fetchone()
-                    if row:
-                        similar.append({
-                            "incident_id": row[0],
-                            "timestamp": row[1],
-                            "error_type": row[2],
-                            "error_message": row[3][:200],
-                            "severity": row[4],
-                            "language": row[5],
-                            "root_cause": row[7],
-                            "resolution": row[8],
-                            "full_rca_summary": row[10][:600] if row[10] else "",
-                            "similarity_score": round(score, 3),
-                        })
+            if not incident_id or incident_id in seen_ids:
+                continue
+            row = conn.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+            if row:
+                seen_ids.add(incident_id)
+                similar.append({
+                    "incident_id": row[0],
+                    "timestamp": row[1],
+                    "error_type": row[2],
+                    "error_message": row[3][:200],
+                    "severity": row[4],
+                    "language": row[5],
+                    "root_cause": row[7],
+                    "resolution": row[8],
+                    "full_rca_summary": row[10][:600] if row[10] else "",
+                    "similarity_score": round(score, 3),
+                })
         conn.close()
+
+        if not similar:
+            return json.dumps({
+                "status": "no_matches",
+                "message": "No similar past incidents found.",
+                "query": query,
+            })
 
         return json.dumps({
             "status": "success",

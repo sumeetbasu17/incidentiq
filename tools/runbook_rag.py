@@ -28,23 +28,48 @@ def get_embeddings():
 
 
 def get_vectorstore():
-    """Get or create the ChromaDB vector store."""
+    """Get or create the ChromaDB vector store with cosine similarity."""
+    import chromadb
+
     embeddings = get_embeddings()
     persist_dir = Config.CHROMA_PERSIST_DIR
+    os.makedirs(persist_dir, exist_ok=True)
 
-    if os.path.exists(persist_dir) and os.listdir(persist_dir):
-        return Chroma(
-            persist_directory=persist_dir,
-            embedding_function=embeddings,
-            collection_name="runbooks",
+    # Ensure the collection uses cosine distance (not the default L2).
+    # Cosine is the standard metric for text-embedding similarity and
+    # produces much better relevance scores for natural-language queries.
+    client = chromadb.PersistentClient(path=persist_dir)
+    COLLECTION_NAME = "runbooks"
+
+    try:
+        existing = client.get_collection(COLLECTION_NAME)
+        meta = existing.metadata or {}
+        if meta.get("hnsw:space") != "cosine":
+            # Migrate: re-create collection with cosine metric, preserving data
+            old_data = existing.get(include=["documents", "metadatas", "embeddings"])
+            client.delete_collection(COLLECTION_NAME)
+            new_col = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+            )
+            if old_data and old_data.get("ids"):
+                new_col.add(
+                    ids=old_data["ids"],
+                    documents=old_data.get("documents"),
+                    metadatas=old_data.get("metadatas"),
+                    embeddings=old_data.get("embeddings"),
+                )
+    except Exception:
+        client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
         )
-    else:
-        os.makedirs(persist_dir, exist_ok=True)
-        return Chroma(
-            persist_directory=persist_dir,
-            embedding_function=embeddings,
-            collection_name="runbooks",
-        )
+
+    return Chroma(
+        persist_directory=persist_dir,
+        embedding_function=embeddings,
+        collection_name=COLLECTION_NAME,
+    )
 
 
 def ingest_document(file_path: str, doc_type: str = "runbook", original_name: str = None) -> dict:
@@ -141,6 +166,9 @@ def search_runbooks(query: str) -> str:
 
         matches = []
         for doc, score in results:
+            # Debug: log all scores to terminal
+            src = doc.metadata.get("source_file", "?")
+            print(f"[Runbook] score={score:.4f} src={src} | query={query[:50]}... | chunk={doc.page_content[:60]}...")
             # Include all results — don't filter by threshold
             # Let the LLM agent decide what's relevant
             matches.append({
